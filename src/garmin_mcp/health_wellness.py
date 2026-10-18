@@ -878,15 +878,28 @@ def register_tools(app):
             if not readiness:
                 return f"No morning training readiness data found for {date}"
 
-            # Curate the morning training readiness data
+            # Curate the morning training readiness data (handle both legacy and current Garmin DTO keys)
             curated = {
-                "date": date,
-                "readiness_score": readiness.get('readinessScore'),
-                "readiness_level": readiness.get('readinessLevel'),
+                "date": readiness.get('calendarDate') or date,
+                "readiness_score": readiness.get('score') if readiness.get('score') is not None else readiness.get('readinessScore'),
+                "readiness_level": readiness.get('level') or readiness.get('readinessLevel'),
+                "feedback": readiness.get('feedbackShort'),
+                "feedback_long": readiness.get('feedbackLong'),
                 "recovery_time_hours": round(readiness.get('recoveryTime', 0) / 60, 1) if readiness.get('recoveryTime') is not None else None,
-                "hrv_status": readiness.get('hrvStatus'),
-                "sleep_quality": readiness.get('sleepQuality'),
+                "recovery_factor_percent": readiness.get('recoveryTimeFactorPercent'),
+                "recovery_factor_feedback": readiness.get('recoveryTimeFactorFeedback'),
+                "hrv_status": readiness.get('hrvStatus') or readiness.get('hrvFactorFeedback'),
+                "hrv_factor_percent": readiness.get('hrvFactorPercent'),
+                "hrv_weekly_avg": readiness.get('hrvWeeklyAverage'),
+                "sleep_quality": readiness.get('sleepQuality') or readiness.get('sleepScoreFactorFeedback'),
                 "sleep_score": readiness.get('sleepScore'),
+                "sleep_factor_percent": readiness.get('sleepScoreFactorPercent'),
+                "sleep_history_factor_percent": readiness.get('sleepHistoryFactorPercent'),
+                "sleep_history_feedback": readiness.get('sleepHistoryFactorFeedback'),
+                "stress_history_factor_percent": readiness.get('stressHistoryFactorPercent'),
+                "stress_history_feedback": readiness.get('stressHistoryFactorFeedback'),
+                "acwr_factor_percent": readiness.get('acwrFactorPercent'),
+                "acwr_factor_feedback": readiness.get('acwrFactorFeedback'),
                 "resting_heart_rate_bpm": readiness.get('restingHeartRate'),
                 "hrv_baseline": readiness.get('hrvBaseline'),
                 "hrv_last_night": readiness.get('hrvLastNight'),
