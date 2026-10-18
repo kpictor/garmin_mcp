@@ -574,6 +574,23 @@ def register_tools(app):
         """
         try:
             status = garmin_client.get_training_status(date)
+            if not status or (
+                not status.get("mostRecentTrainingStatus")
+                and not status.get("mostRecentVO2Max")
+            ):
+                try:
+                    base_dt = datetime.date.fromisoformat(date)
+                    for offset in (1, 2):
+                        prev_date = (base_dt - datetime.timedelta(days=offset)).isoformat()
+                        prev_status = garmin_client.get_training_status(prev_date)
+                        if prev_status and (
+                            prev_status.get("mostRecentTrainingStatus")
+                            or prev_status.get("mostRecentVO2Max")
+                        ):
+                            status = prev_status
+                            break
+                except Exception:
+                    pass
             if not status:
                 return f"No training status data found for {date}."
 
