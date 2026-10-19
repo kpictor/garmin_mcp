@@ -51,15 +51,24 @@ def register_tools(app):
             }
 
             for w in all_measurements:
+                raw_met_age = w.get("metabolicAge")
+                met_age_years = None
+                if raw_met_age is not None:
+                    met_age_years = round(raw_met_age / 31556926000) if raw_met_age > 1000 else int(raw_met_age)
                 measurement = {
                     "date": w.get("calendarDate"),
                     "weight_grams": w.get("weight"),
                     "weight_kg": round(w.get("weight", 0) / 1000, 2) if w.get("weight") else None,
-                    "bmi": w.get("bmi"),
+                    "bmi": round(w.get("bmi"), 1) if w.get("bmi") else None,
                     "body_fat_percent": w.get("bodyFat"),
                     "body_water_percent": w.get("bodyWater"),
                     "bone_mass_grams": w.get("boneMass"),
+                    "bone_mass_kg": round(w.get("boneMass") / 1000, 2) if w.get("boneMass") else None,
                     "muscle_mass_grams": w.get("muscleMass"),
+                    "muscle_mass_kg": round(w.get("muscleMass") / 1000, 2) if w.get("muscleMass") else None,
+                    "visceral_fat": w.get("visceralFat"),
+                    "basal_met": w.get("basalMet"),
+                    "metabolic_age": met_age_years,
                     "source_type": w.get("sourceType"),
                     "timestamp_gmt": w.get("timestampGMT"),
                 }
@@ -67,9 +76,14 @@ def register_tools(app):
                 measurement = {k: v for k, v in measurement.items() if v is not None}
                 curated["measurements"].append(measurement)
 
-            # Sort by date descending (most recent first)
+            # Sort by date descending, preferring BIA entries (with body_fat_percent) on the same date
             curated["measurements"].sort(
-                key=lambda x: x.get("date") or "", reverse=True
+                key=lambda x: (
+                    x.get("date") or "",
+                    1 if x.get("body_fat_percent") is not None else 0,
+                    x.get("timestamp_gmt") or 0,
+                ),
+                reverse=True,
             )
 
             # Include average if available
