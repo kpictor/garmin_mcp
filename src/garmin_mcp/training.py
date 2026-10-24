@@ -5,7 +5,7 @@ Training and performance functions for Garmin Connect MCP Server
 import json
 import datetime
 import math
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Literal, Optional, Tuple, Union
 
 # The garmin_client will be set by the main file
 garmin_client = None
@@ -26,6 +26,22 @@ def _as_dict(value: Any) -> Dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
 
+# The fitnessstats "calories" metric is stored pre-multiplied by this factor
+# (verified empirically: activity kcal totals from get_activity/get_stats
+# times exactly 4.19 reproduce the raw sum/avg/min/max here). It doesn't match
+# either standard kJ/kcal constant (4.184 thermochemical, 4.1868 IT), so this
+# is a Garmin-side unit quirk specific to this endpoint's "calories" field,
+# not a general kJ conversion.
+_PROGRESS_CALORIES_FACTOR = 4.19
+
+
+def _convert_progress_metric(metric: str, value: Optional[float]) -> Optional[float]:
+    """Convert a raw progress-summary stat value to its documented unit."""
+    if value is None or metric != "calories":
+        return value
+    return value / _PROGRESS_CALORIES_FACTOR
+
+
 def _extract_vo2_measurements(data: Any) -> Dict[str, float]:
     """Find all VO2 max values by sport in known Garmin response shapes."""
     if isinstance(data, list):
@@ -37,20 +53,22 @@ def _extract_vo2_measurements(data: Any) -> Dict[str, float]:
 
     data = _as_dict(data)
     # Garmin uses "generic" for its running/non-cycling VO2 max series.
+    # Prefer "PreciseValue" fields: vo2MaxValue is rounded to 0.5 while the
+    # Connect web chart and training status report the 0.1-precision estimate.
     candidate_paths = (
         (("vo2MaxRunning",), "running"),
         (("vo2MaxCycling",), "cycling"),
         (("vo2Max",), "running"),
-        (("vo2MaxValue",), "running"),
         (("vo2MaxPreciseValue",), "running"),
-        (("generic", "vo2MaxValue"), "running"),
+        (("vo2MaxValue",), "running"),
         (("generic", "vo2MaxPreciseValue"), "running"),
-        (("cycling", "vo2MaxValue"), "cycling"),
+        (("generic", "vo2MaxValue"), "running"),
         (("cycling", "vo2MaxPreciseValue"), "cycling"),
-        (("mostRecentVO2Max", "generic", "vo2MaxValue"), "running"),
+        (("cycling", "vo2MaxValue"), "cycling"),
         (("mostRecentVO2Max", "generic", "vo2MaxPreciseValue"), "running"),
-        (("mostRecentVO2Max", "cycling", "vo2MaxValue"), "cycling"),
+        (("mostRecentVO2Max", "generic", "vo2MaxValue"), "running"),
         (("mostRecentVO2Max", "cycling", "vo2MaxPreciseValue"), "cycling"),
+        (("mostRecentVO2Max", "cycling", "vo2MaxValue"), "cycling"),
         (("userData", "vo2MaxRunning"), "running"),
         (("userData", "vo2MaxCycling"), "cycling"),
     )
@@ -103,6 +121,180 @@ def _get_max_metrics_range(
         return False, None
 
     return True, connectapi(f"{metrics_url}/{start_date}/{end_date}")
+
+
+def _is_forbidden_error(exc: Exception) -> bool:
+    """True when Garmin rejected the call with HTTP 403 Forbidden."""
+    text = str(exc).lower()
+    return "403" in text or "forbidden" in text
+
+
+def _first_present(mapping: Any, *keys: str) -> Any:
+    """Return the first non-None value for keys on a mapping-like object."""
+    data = _as_dict(mapping)
+    for key in keys:
+        value = data.get(key)
+        if value is not None:
+            return value
+    return None
+
+
+def _activity_id_matches(item: Any, activity_id: int) -> bool:
+    """Compare Garmin activityId values that may arrive as int or str."""
+    raw = _as_dict(item).get("activityId")
+    try:
+        return int(raw) == int(activity_id)
+    except (TypeError, ValueError):
+        return str(raw) == str(activity_id)
+
+
+def _as_activity_list(payload: Any) -> List[Dict[str, Any]]:
+    """Normalize activity-search payloads to a list of dicts."""
+    if isinstance(payload, list):
+        return [item for item in payload if isinstance(item, dict)]
+    data = _as_dict(payload)
+    for key in ("activityList", "activities"):
+        nested = data.get(key)
+        if isinstance(nested, list):
+            return [item for item in nested if isinstance(item, dict)]
+    return []
+
+
+def _lookup_activity_in_list(client: Any, activity_id: int, limit: int = 100):
+    """Find an activity in the list-search endpoint, which often works when details 403.
+
+    Garmin's `/activity-service/activity/{id}` endpoint returns HTTP 403 for some
+    valid, recently synced activities. The list search used by get_activities
+    still includes aerobic/anaerobic training effect on those same records.
+    """
+    url = getattr(
+        client,
+        "garmin_connect_activities",
+        "/activitylist-service/activities/search/activities",
+    )
+    connectapi = getattr(client, "connectapi", None)
+    search_attempts: List[Dict[str, str]] = [
+        {"activityIds": str(activity_id), "start": "0", "limit": "1"},
+        {"start": "0", "limit": str(limit)},
+    ]
+    if callable(connectapi):
+        for params in search_attempts:
+            try:
+                payload = connectapi(url, params=params)
+            except Exception:
+                continue
+            match = next(
+                (
+                    item
+                    for item in _as_activity_list(payload)
+                    if _activity_id_matches(item, activity_id)
+                ),
+                None,
+            )
+            if match is not None:
+                return match
+
+    get_activities = getattr(client, "get_activities", None)
+    if callable(get_activities):
+        try:
+            payload = get_activities(0, limit)
+        except Exception:
+            payload = None
+        return next(
+            (
+                item
+                for item in _as_activity_list(payload)
+                if _activity_id_matches(item, activity_id)
+            ),
+            None,
+        )
+    return None
+
+
+def _minutes_to_hours(value: Any) -> Optional[float]:
+    """Convert Garmin recovery minutes to hours, or None if missing/invalid."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    if value <= 0 or not math.isfinite(value):
+        return None
+    return round(value / 60.0, 1)
+
+
+def _curate_training_effect(
+    activity: Any, activity_id: int, source: str
+) -> Dict[str, Any]:
+    """Pull training-effect fields from either details or list-search shapes."""
+    activity = _as_dict(activity)
+    summary = _as_dict(activity.get("summaryDTO"))
+    aerobic = _first_present(
+        summary, "trainingEffect", "aerobicTrainingEffect"
+    ) or _first_present(activity, "aerobicTrainingEffect", "trainingEffect")
+    anaerobic = _first_present(summary, "anaerobicTrainingEffect") or _first_present(
+        activity, "anaerobicTrainingEffect"
+    )
+    label = _first_present(summary, "trainingEffectLabel") or _first_present(
+        activity, "trainingEffectLabel", "aerobicTrainingEffectMessage"
+    )
+    recovery = _first_present(summary, "recoveryTime") or _first_present(
+        activity, "recoveryTime"
+    )
+    load = _first_present(summary, "activityTrainingLoad") or _first_present(
+        activity, "activityTrainingLoad"
+    )
+    performance = _first_present(summary, "performanceCondition") or _first_present(
+        activity, "performanceCondition"
+    )
+    curated = {
+        "activity_id": activity_id,
+        "source": source,
+        "training_effect": aerobic,
+        "aerobic_effect": aerobic,
+        "anaerobic_effect": anaerobic,
+        "training_effect_label": label,
+        "recovery_time_hours": _minutes_to_hours(recovery),
+        "training_load": load,
+        "performance_condition": performance,
+    }
+    return {key: value for key, value in curated.items() if value is not None}
+
+
+def _build_vo2_trend_series(
+    history: List[Dict[str, Any]], end_date: datetime.date
+) -> List[Dict[str, Any]]:
+    """Expand sparse max-metrics days into a dense daily series.
+
+    Garmin's max-metrics endpoint records an entry only on days with a VO2 max
+    recompute (after an activity), while the Connect web chart carries each
+    value forward until the next one. Emit the carried-forward days too so the
+    series matches the chart instead of collapsing to recompute days.
+    """
+    series: List[Dict[str, Any]] = []
+    if not history:
+        return series
+
+    measured = {entry["date"]: entry for entry in history}
+    current = datetime.date.fromisoformat(min(measured))
+    last: Optional[Dict[str, Any]] = None
+    while current <= end_date:
+        entry = measured.get(current.isoformat())
+        if entry is not None:
+            last = {
+                "date": entry["date"],
+                "vo2_max": entry["vo2_max"],
+                "source": entry["source"],
+            }
+            series.append(last)
+        elif last is not None:
+            series.append(
+                {
+                    "date": current.isoformat(),
+                    "vo2_max": last["vo2_max"],
+                    "source": last["source"],
+                    "carried_forward": True,
+                }
+            )
+        current += datetime.timedelta(days=1)
+    return series
 
 
 def _get_activity_type_mapping() -> Dict[int, str]:
@@ -166,7 +358,11 @@ def register_tools(app):
         Args:
             start_date: Start date in YYYY-MM-DD format
             end_date: End date in YYYY-MM-DD format
-            metric: Metric to get progress for (e.g., "elevationGain", "duration", "distance", "movingDuration")
+            metric: Metric to get progress for (e.g., "elevationGain", "duration", "distance", "movingDuration", "calories")
+
+        Note: "calories" values are returned in kcal. Garmin's underlying
+        endpoint stores this metric pre-scaled by ~4.19; this tool undoes
+        that scaling before returning.
         """
         try:
             summary_data = garmin_client.get_progress_summary_between_dates(
@@ -182,29 +378,37 @@ def register_tools(app):
             else:
                 return f"Unexpected response format from API"
 
-            # Curate to essential fields only
+            # Curate to essential fields only. `date` and `countOfActivities`
+            # from the raw response are dropped/replaced below: Garmin's
+            # fitnessstats endpoint echoes today's date regardless of the
+            # queried range, and its countOfActivities matches neither the
+            # true activity count nor the per-type counts in `stats`.
             curated = {
                 "metric": metric,
                 "start_date": start_date,
                 "end_date": end_date,
-                "date": data.get("date"),
-                "count_of_activities": data.get("countOfActivities"),
                 "stats_by_activity_type": {},
             }
 
-            # Parse stats by activity type
-            stats = data.get("stats", {})
+            # Parse stats by activity type. `or {}` guards against an explicit
+            # null `stats` (Garmin sends null for empty sections), which would
+            # otherwise raise "'NoneType' object has no attribute 'items'".
+            stats = data.get("stats") or {}
             for activity_type, activity_stats in stats.items():
                 if metric in activity_stats:
                     metric_data = activity_stats[metric]
                     if metric_data and metric_data.get("count", 0) > 0:
                         curated["stats_by_activity_type"][activity_type] = {
                             "count": metric_data.get("count"),
-                            "sum": metric_data.get("sum"),
-                            "avg": metric_data.get("avg"),
-                            "min": metric_data.get("min"),
-                            "max": metric_data.get("max"),
+                            "sum": _convert_progress_metric(metric, metric_data.get("sum")),
+                            "avg": _convert_progress_metric(metric, metric_data.get("avg")),
+                            "min": _convert_progress_metric(metric, metric_data.get("min")),
+                            "max": _convert_progress_metric(metric, metric_data.get("max")),
                         }
+
+            curated["count_of_activities"] = sum(
+                v["count"] for v in curated["stats_by_activity_type"].values()
+            )
 
             # Remove None values
             curated = {k: v for k, v in curated.items() if v is not None}
@@ -386,46 +590,48 @@ def register_tools(app):
 
     @app.tool()
     async def get_training_effect(activity_id: int) -> str:
-        """Get training effect data for a specific activity
+        """Get training effect data for a specific activity.
+
+        Uses activity details first. If Garmin returns HTTP 403 for that
+        endpoint (seen on valid, recent activities), falls back to activity
+        list search, which still includes aerobic/anaerobic training effect.
 
         Args:
             activity_id: ID of the activity to retrieve training effect for
         """
         try:
-            # Training effect data is available through get_activity
-            # The garminconnect library doesn't have a separate get_training_effect method
+            activity_id = int(activity_id)
+        except (TypeError, ValueError):
+            return f"Invalid activity ID: {activity_id}"
+
+        source = "activity_details"
+        detail_error: Optional[Exception] = None
+        try:
             activity = garmin_client.get_activity(activity_id)
+        except Exception as e:
+            if not _is_forbidden_error(e):
+                return f"Error retrieving training effect data: {e}"
+            activity = None
+            detail_error = e
+
+        if not activity:
+            source = "activity_list"
+            try:
+                activity = _lookup_activity_in_list(garmin_client, activity_id)
+            except Exception as e:
+                return f"Error retrieving training effect data: {e}"
             if not activity:
+                if detail_error is not None:
+                    return (
+                        "Error retrieving training effect data: Garmin returned HTTP 403 "
+                        f"for activity {activity_id} details, and the activity was not "
+                        "found in recent activity search."
+                    )
                 return f"No activity found with ID {activity_id}."
 
-            # Extract training effect data from activity summary
-            summary = activity.get("summaryDTO", {})
-
-            # Curate to essential fields only
-            curated = {
-                "activity_id": activity_id,
-                "training_effect": summary.get("trainingEffect"),
-                "aerobic_effect": summary.get("trainingEffect"),
-                "anaerobic_effect": summary.get("anaerobicTrainingEffect"),
-                "training_effect_label": summary.get("trainingEffectLabel"),
-                # Recovery metrics
-                "recovery_time_hours": (
-                    round(summary.get("recoveryTime", 0) / 60, 1)
-                    if summary.get("recoveryTime")
-                    else None
-                ),
-                # Training load
-                "training_load": summary.get("activityTrainingLoad"),
-                # Additional metrics that may be available
-                "performance_condition": summary.get("performanceCondition"),
-            }
-
-            # Remove None values
-            curated = {k: v for k, v in curated.items() if v is not None}
-
-            return json.dumps(curated, indent=2)
-        except Exception as e:
-            return f"Error retrieving training effect data: {str(e)}"
+        return json.dumps(
+            _curate_training_effect(activity, activity_id, source), indent=2
+        )
 
     @app.tool()
     async def get_hrv_data(date: str, return_timeseries: bool = False) -> str:
@@ -440,9 +646,13 @@ def register_tools(app):
             if not hrv_data:
                 return f"No HRV data found for {date}."
 
-            # Extract the summary from hrvSummary key
-            summary = hrv_data.get("hrvSummary", {})
-            baseline = summary.get("baseline", {})
+            # Extract the summary from hrvSummary key.
+            # Use `x.get(key) or {}` rather than `x.get(key, {})`: Garmin sends
+            # an explicit null for sections the user has no data in, and a
+            # default only applies when the key is absent. Same pattern as
+            # get_training_status.
+            summary = hrv_data.get("hrvSummary") or {}
+            baseline = summary.get("baseline") or {}
 
             # Curate to essential fields only
             curated = {
@@ -573,7 +783,7 @@ def register_tools(app):
             date: Date in YYYY-MM-DD format
         """
         try:
-            status = garmin_client.get_training_status(date)
+            status = _as_dict(garmin_client.get_training_status(date))
             if not status or (
                 not status.get("mostRecentTrainingStatus")
                 and not status.get("mostRecentVO2Max")
@@ -582,7 +792,7 @@ def register_tools(app):
                     base_dt = datetime.date.fromisoformat(date)
                     for offset in (1, 2):
                         prev_date = (base_dt - datetime.timedelta(days=offset)).isoformat()
-                        prev_status = garmin_client.get_training_status(prev_date)
+                        prev_status = _as_dict(garmin_client.get_training_status(prev_date))
                         if prev_status and (
                             prev_status.get("mostRecentTrainingStatus")
                             or prev_status.get("mostRecentVO2Max")
@@ -595,29 +805,33 @@ def register_tools(app):
                 return f"No training status data found for {date}."
 
             # Extract from nested structure
-            # Use `(x.get(key) or {})` instead of `x.get(key, {})` so that
-            # explicit null values in the API response are treated as missing
-            # rather than causing `NoneType has no attribute 'get'` errors.
-            recent_status = (status.get("mostRecentTrainingStatus") or {})
-            latest_data = (recent_status.get("latestTrainingStatusData") or {})
+            # Use `_as_dict()` for nested Garmin sections so null or non-dict
+            # values are treated as missing instead of causing attribute errors.
+            recent_status = _as_dict(status.get("mostRecentTrainingStatus"))
+            latest_data = _as_dict(recent_status.get("latestTrainingStatusData"))
 
             # Get first device data (usually the primary device)
             device_data = {}
-            for device_id, data in latest_data.items():
+            for data in latest_data.values():
+                if not isinstance(data, dict) or not data:
+                    continue
                 device_data = data
                 break
 
-            acwr_data = (device_data.get("acuteTrainingLoadDTO") or {})
+            acwr_data = _as_dict(device_data.get("acuteTrainingLoadDTO"))
 
             # VO2 Max data
-            vo2_data = (status.get("mostRecentVO2Max") or {}).get("generic") or {}
-            cycling_vo2_data = (status.get("mostRecentVO2Max") or {}).get("cycling") or {}
+            most_recent_vo2 = _as_dict(status.get("mostRecentVO2Max"))
+            vo2_data = _as_dict(most_recent_vo2.get("generic"))
+            cycling_vo2_data = _as_dict(most_recent_vo2.get("cycling"))
 
             # Training load balance
-            load_balance = (status.get("mostRecentTrainingLoadBalance") or {})
-            load_map = (load_balance.get("metricsTrainingLoadBalanceDTOMap") or {})
+            load_balance = _as_dict(status.get("mostRecentTrainingLoadBalance"))
+            load_map = _as_dict(load_balance.get("metricsTrainingLoadBalanceDTOMap"))
             load_data = {}
-            for device_id, data in load_map.items():
+            for data in load_map.values():
+                if not isinstance(data, dict) or not data:
+                    continue
                 load_data = data
                 break
 
@@ -730,10 +944,13 @@ def register_tools(app):
                 # Process speed history
                 speed_history = threshold.get("speed", [])
                 if speed_history:
+                    # Garmin returns speed as seconds/metre (inverse pace); invert to m/s.
                     curated["speed_history"] = [
                         {
                             "date": entry.get("from"),
-                            "speed_mps": entry.get("value"),
+                            "speed_mps": (
+                                1 / entry.get("value") if entry.get("value") else None
+                            ),
                             "series": entry.get("series"),
                         }
                         for entry in speed_history
@@ -767,9 +984,11 @@ def register_tools(app):
                 speed_hr = threshold.get("speed_and_heart_rate", {})
                 power = threshold.get("power", {})
 
+                raw_speed = speed_hr.get("speed")
                 curated = {
                     # Speed and heart rate data
-                    "lactate_threshold_speed_mps": speed_hr.get("speed"),
+                    # Garmin returns speed as seconds/metre (inverse pace); invert to m/s.
+                    "lactate_threshold_speed_mps": 1 / raw_speed if raw_speed else None,
                     "lactate_threshold_heart_rate_bpm": speed_hr.get("heartRate"),
                     "heart_rate_cycling_bpm": speed_hr.get("heartRateCycling"),
                     "speed_hr_date": speed_hr.get("calendarDate"),
@@ -1047,7 +1266,7 @@ def register_tools(app):
                 if data:
                     hrv_summary = data.get("hrvSummary", {})
                     entry: Dict[str, Any] = {"date": date_str}
-                    last_night = hrv_summary.get("lastNight")
+                    last_night = hrv_summary.get("lastNightAvg")
                     weekly_avg = hrv_summary.get("weeklyAvg")
                     status = hrv_summary.get("status")
                     feedback = hrv_summary.get("feedbackPhrase")
@@ -1071,7 +1290,7 @@ def register_tools(app):
         if not trend:
             return f"No HRV data found between {start_date} and {end_date}."
 
-        # Compute 7-day rolling average from the collected data
+        # Compute the period average from the available nightly values
         hrv_values = [e.get("last_night_avg_hrv_ms") for e in trend if e.get("last_night_avg_hrv_ms") is not None]
         rolling_avg = None
         if hrv_values:
@@ -1095,6 +1314,10 @@ def register_tools(app):
 
         Note: VO2 max estimates are smoothed and update gradually — daily changes of <0.5
         are within normal noise. Focus on the 4-6 week trend direction.
+
+        Garmin records a new VO2 max value only on days with a recompute (after an
+        activity). Days in between carry the last known value forward and are marked
+        with "carried_forward": true, matching the trend chart in Garmin Connect.
 
         If historical values are unavailable, the current profile estimate is returned
         separately and is not represented as a historical trend point.
@@ -1182,13 +1405,9 @@ def register_tools(app):
                 ),
             )
 
-        trend = []
-        last_vo2 = None
-        if selected_sport is not None:
-            for entry in histories[selected_sport]:
-                if entry["vo2_max"] != last_vo2:
-                    trend.append(entry)
-                    last_vo2 = entry["vo2_max"]
+        trend = _build_vo2_trend_series(
+            histories[selected_sport] if selected_sport is not None else [], end
+        )
 
         current_estimate = None
         current_sport = None
@@ -1306,5 +1525,215 @@ def register_tools(app):
             "period_avg_sleep_breaths_per_min": avg_sleep_overall,
             "trend": trend,
         }, indent=2)
+
+    @app.tool()
+    async def get_running_tolerance(date: str) -> str:
+        """Get Running Tolerance for a single day.
+
+        Returns Garmin's running load capacity model: how much running load the
+        athlete can currently absorb (tolerance), the intensity-adjusted load
+        their recent runs have produced (acute load), and the raw distance behind
+        that load. All three are expressed in km so they're directly comparable —
+        `load_ratio` (acute_load_km / distance_km) quantifies how much intensity
+        is inflating the cost of each kilometer run.
+
+        Args:
+            date: Date in YYYY-MM-DD format
+        """
+        try:
+            data = garmin_client.get_running_tolerance(date, date, aggregation="daily")
+        except Exception as e:
+            return f"Error retrieving running tolerance data: {str(e)}"
+
+        if not data:
+            return "Your device does not support this metric."
+
+        entry = data[0]
+        tolerance = entry.get("acuteTolerance")
+        acute_load = entry.get("acuteImpactLoad")
+        distance = entry.get("acuteDistance")
+
+        curated: Dict[str, Any] = {"date": entry.get("calendarDate", date)}
+        if tolerance is not None:
+            curated["tolerance_km"] = round(tolerance / 1000, 2)
+        if acute_load is not None:
+            curated["acute_load_km"] = round(acute_load / 1000, 2)
+        if distance is not None:
+            curated["distance_km"] = round(distance / 1000, 2)
+        if acute_load is not None and distance:
+            curated["load_ratio"] = round(acute_load / distance, 2)
+        feedback = entry.get("runningToleranceFeedBackPhrase")
+        if feedback:
+            curated["feedback_phrase"] = feedback
+
+        return json.dumps(curated, indent=2)
+
+    @app.tool()
+    async def get_running_tolerance_trend(
+        start_date: str,
+        end_date: str,
+        aggregation: Literal["daily", "weekly"] = "weekly",
+    ) -> str:
+        """Get Running Tolerance trend over a date range.
+
+        Running Tolerance moves slowly — its value is in the trajectory, not any
+        single day. Returns, per period: tolerance_km (current load capacity),
+        acute_load_km (intensity-adjusted load), distance_km (actual distance
+        run), and load_ratio (acute_load_km / distance_km — how much intensity
+        inflates the cost of each kilometer). Weekly aggregation (default) gives
+        a compact multi-month view; daily gives day-to-day resolution for a
+        shorter window.
+
+        Recommended range: 4-12 weeks. Maximum: 90 days for daily aggregation,
+        366 days for weekly (this endpoint returns the whole range in one call,
+        so the limit protects output size, not request volume).
+
+        Args:
+            start_date: Start date in YYYY-MM-DD format
+            end_date: End date in YYYY-MM-DD format
+            aggregation: "daily" or "weekly" (default "weekly")
+        """
+        try:
+            start = datetime.date.fromisoformat(start_date)
+            end = datetime.date.fromisoformat(end_date)
+        except ValueError as e:
+            return f"Invalid date format: {e}. Use YYYY-MM-DD."
+
+        days = (end - start).days + 1
+        if days < 1:
+            return "end_date must be on or after start_date."
+
+        max_days = 90 if aggregation == "daily" else 366
+        if days > max_days:
+            return (
+                f"Date range too large ({days} days). Maximum is {max_days} "
+                f"days for {aggregation} aggregation."
+            )
+
+        try:
+            data = garmin_client.get_running_tolerance(
+                start_date, end_date, aggregation=aggregation
+            )
+        except Exception as e:
+            return f"Error retrieving running tolerance trend: {str(e)}"
+
+        if not data:
+            return "Your device does not support this metric."
+
+        trend = []
+        for entry in data:
+            if aggregation == "daily":
+                tolerance = entry.get("acuteTolerance")
+                acute_load = entry.get("acuteImpactLoad")
+                distance = entry.get("acuteDistance")
+            else:
+                tolerance = entry.get("tolerance")
+                acute_load = entry.get("totalImpactLoad")
+                distance = entry.get("totalDistance")
+
+            point: Dict[str, Any] = {"date": entry.get("calendarDate")}
+            if tolerance is not None:
+                point["tolerance_km"] = round(tolerance / 1000, 2)
+            if acute_load is not None:
+                point["acute_load_km"] = round(acute_load / 1000, 2)
+            if distance is not None:
+                point["distance_km"] = round(distance / 1000, 2)
+            if acute_load is not None and distance:
+                point["load_ratio"] = round(acute_load / distance, 2)
+
+            if aggregation == "daily":
+                feedback = entry.get("runningToleranceFeedBackPhrase")
+                if feedback:
+                    point["feedback_phrase"] = feedback
+            else:
+                if entry.get("startOfWeek") is not None:
+                    point["start_of_week"] = entry.get("startOfWeek")
+                if entry.get("endOfWeek") is not None:
+                    point["end_of_week"] = entry.get("endOfWeek")
+                if entry.get("weekIndex") is not None:
+                    point["week_index"] = entry.get("weekIndex")
+
+            trend.append(point)
+
+        # The daily aggregation is not returned in chronological order by the API.
+        trend.sort(key=lambda p: p.get("date") or "")
+
+        tolerance_values = [p["tolerance_km"] for p in trend if "tolerance_km" in p]
+        first_tolerance = tolerance_values[0] if tolerance_values else None
+        latest_tolerance = tolerance_values[-1] if tolerance_values else None
+        change = (
+            round(latest_tolerance - first_tolerance, 2)
+            if first_tolerance is not None and latest_tolerance is not None
+            else None
+        )
+
+        return json.dumps({
+            "start_date": start_date,
+            "end_date": end_date,
+            "aggregation": aggregation,
+            "data_points": len(trend),
+            "first_tolerance_km": first_tolerance,
+            "latest_tolerance_km": latest_tolerance,
+            "tolerance_change_km": change,
+            "trend": trend,
+        }, indent=2)
+
+    @app.tool()
+    async def get_acclimation(date: str) -> str:
+        """Get heat and altitude acclimation status for a given date.
+
+        Garmin tracks how adapted the athlete currently is to training in heat
+        and at altitude. heat_acclimation_percent runs 0-100 and decays without
+        continued exposure; use it to judge readiness for a warm-weather race.
+
+        heat_trend reports Garmin's own label (e.g. ACCLIMATIZED). The
+        previous_* fields hold the prior reading so direction of travel is
+        visible without a second call.
+
+        VO2 max is not returned here; use get_training_status or get_vo2max_trend.
+
+        Args:
+            date: Date in YYYY-MM-DD format
+        """
+        try:
+            data = garmin_client.get_max_metrics(date)
+        except Exception as e:
+            return f"Error retrieving acclimation data: {str(e)}"
+
+        if isinstance(data, list):
+            data = data[0] if data else None
+        if not isinstance(data, dict):
+            return f"No acclimation data found for {date}."
+
+        acc = _as_dict(data.get("heatAltitudeAcclimation"))
+        if not acc:
+            return (
+                f"No acclimation data found for {date}. Garmin populates this only "
+                "after outdoor activities in heat or at altitude."
+            )
+
+        result: Dict[str, Any] = {"date": acc.get("calendarDate", date)}
+
+        for out_key, in_key in (
+            ("heat_acclimation_percent", "heatAcclimationPercentage"),
+            ("previous_heat_acclimation_percent", "previousHeatAcclimationPercentage"),
+            ("heat_trend", "heatTrend"),
+            ("heat_acclimation_date", "heatAcclimationDate"),
+            ("previous_heat_acclimation_date", "previousHeatAcclimationDate"),
+            ("altitude_acclimation_meters", "altitudeAcclimation"),
+            ("previous_altitude_acclimation_meters", "previousAltitudeAcclimation"),
+            ("altitude_trend", "altitudeTrend"),
+            ("current_altitude_meters", "currentAltitude"),
+        ):
+            value = acc.get(in_key)
+            if value is not None:
+                result[out_key] = value
+
+        heat = result.get("heat_acclimation_percent")
+        prev = result.get("previous_heat_acclimation_percent")
+        if isinstance(heat, (int, float)) and isinstance(prev, (int, float)):
+            result["heat_acclimation_change"] = round(heat - prev, 1)
+
+        return json.dumps(result, indent=2)
 
     return app

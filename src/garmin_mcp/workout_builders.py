@@ -132,6 +132,157 @@ def build_run_json(
     }
 
 
+def build_run_interval_json(
+    name: str,
+    repeats: int,
+    rep_seconds: int,
+    recovery_seconds: int,
+    warmup_min: int,
+    cooldown_min: int,
+    hr_zone: str = "Z4",
+    hr_min: Optional[int] = None,
+    hr_max: Optional[int] = None,
+    recovery_hr_min: Optional[int] = None,
+    recovery_hr_max: Optional[int] = None,
+) -> dict:
+    """Build the Garmin Connect JSON for a repeat-based interval run workout.
+
+    Structure: warmup -> repeats x [work interval + jog recovery] -> cooldown.
+
+    The work intervals target a named heart-rate zone (hr_zone) by default;
+    pass hr_min and hr_max together to target an exact custom bpm range
+    instead. Named zones are usually too wide for interval work -- a
+    lactate-threshold session at 172-180 bpm sits inside a Z3 that may span
+    158-184, so the watch would report "in range" for efforts well below and
+    above the intended one.
+
+    Recovery steps carry no target unless recovery_hr_min/max are given.
+    A capped recovery alerts continuously for the first minute or two after
+    a hard rep, because heart rate lags the effort -- usually noise rather
+    than signal.
+    """
+    if repeats < 1:
+        raise ValueError("repeats must be >= 1")
+    if rep_seconds < 1:
+        raise ValueError("rep_seconds must be >= 1")
+    if recovery_seconds < 0:
+        raise ValueError("recovery_seconds must be >= 0")
+
+    hr_target_fields, hr_desc = _hr_target(hr_zone, hr_min, hr_max)
+
+    rep_display = f"{rep_seconds // 60}m" if rep_seconds % 60 == 0 else f"{rep_seconds}s"
+    rec_display = (
+        f"{recovery_seconds // 60}m"
+        if recovery_seconds % 60 == 0
+        else f"{recovery_seconds}s"
+    )
+
+    # Steps inside the repeat group. The group itself occupies one step order
+    # and its children continue numbering from there, so a mis-numbered child
+    # is the usual cause of a workout that uploads cleanly but renders
+    # scrambled on the watch.
+    repeat_children = [
+        {
+            "type": "ExecutableStepDTO",
+            "stepOrder": 3,
+            "stepType": {"stepTypeId": 3, "stepTypeKey": "interval"},
+            "description": f"Rep {rep_seconds}s {hr_desc}",
+            "endCondition": {"conditionTypeId": 2, "conditionTypeKey": "time"},
+            "endConditionValue": float(rep_seconds),
+            "targetType": {
+                "workoutTargetTypeId": 4,
+                "workoutTargetTypeKey": "heart.rate.zone",
+            },
+            **hr_target_fields,
+        }
+    ]
+
+    if recovery_seconds > 0:
+        recovery_step = {
+            "type": "ExecutableStepDTO",
+            "stepOrder": 4,
+            "stepType": {"stepTypeId": 4, "stepTypeKey": "recovery"},
+            "description": f"Jog {recovery_seconds}s",
+            "endCondition": {"conditionTypeId": 2, "conditionTypeKey": "time"},
+            "endConditionValue": float(recovery_seconds),
+            "targetType": {
+                "workoutTargetTypeId": 1,
+                "workoutTargetTypeKey": "no.target",
+            },
+        }
+        if recovery_hr_min is not None and recovery_hr_max is not None:
+            rec_fields, rec_desc = _hr_target(None, recovery_hr_min, recovery_hr_max)
+            recovery_step["targetType"] = {
+                "workoutTargetTypeId": 4,
+                "workoutTargetTypeKey": "heart.rate.zone",
+            }
+            recovery_step.update(rec_fields)
+            recovery_step["description"] = f"Jog {recovery_seconds}s {rec_desc}"
+        repeat_children.append(recovery_step)
+
+    cooldown_order = 3 + len(repeat_children)
+
+    return {
+        "workoutName": name,
+        "description": (
+            f"{warmup_min}m warmup + {repeats}x({rep_display} {hr_desc} / "
+            f"{rec_display} jog) + {cooldown_min}m cooldown"
+        ),
+        "sportType": {"sportTypeId": 1, "sportTypeKey": "running"},
+        "workoutSegments": [
+            {
+                "segmentOrder": 1,
+                "sportType": {"sportTypeId": 1, "sportTypeKey": "running"},
+                "workoutSteps": [
+                    {
+                        "type": "ExecutableStepDTO",
+                        "stepOrder": 1,
+                        "stepType": {"stepTypeId": 1, "stepTypeKey": "warmup"},
+                        "description": f"Warmup {warmup_min} min",
+                        "endCondition": {
+                            "conditionTypeId": 2,
+                            "conditionTypeKey": "time",
+                        },
+                        "endConditionValue": float(warmup_min * 60),
+                        "targetType": {
+                            "workoutTargetTypeId": 1,
+                            "workoutTargetTypeKey": "no.target",
+                        },
+                    },
+                    {
+                        "type": "RepeatGroupDTO",
+                        "stepOrder": 2,
+                        "stepType": {"stepTypeId": 6, "stepTypeKey": "repeat"},
+                        "numberOfIterations": repeats,
+                        "smartRepeat": False,
+                        "endCondition": {
+                            "conditionTypeId": 7,
+                            "conditionTypeKey": "iterations",
+                        },
+                        "endConditionValue": float(repeats),
+                        "workoutSteps": repeat_children,
+                    },
+                    {
+                        "type": "ExecutableStepDTO",
+                        "stepOrder": cooldown_order,
+                        "stepType": {"stepTypeId": 2, "stepTypeKey": "cooldown"},
+                        "description": f"Cooldown {cooldown_min} min",
+                        "endCondition": {
+                            "conditionTypeId": 2,
+                            "conditionTypeKey": "time",
+                        },
+                        "endConditionValue": float(cooldown_min * 60),
+                        "targetType": {
+                            "workoutTargetTypeId": 1,
+                            "workoutTargetTypeKey": "no.target",
+                        },
+                    },
+                ],
+            }
+        ],
+    }
+
+
 def build_walk_run_json(
     name: str,
     run_seconds: int,
@@ -261,11 +412,14 @@ def build_strength_json(
 ) -> dict:
     """Build the Garmin Connect JSON for a strength workout.
 
-    Each exercise becomes a reps-based work step. The name is preserved in the step
-    "description", which is what survives the round trip. It is also sent as
-    "exerciseName", but Garmin only retains that when it matches one of its own
-    exercise keys (e.g. "FARMERS_CARRY"); any other value is accepted and then
-    stored as an empty string.
+    Each exercise becomes a reps-based work step. When "sets" > 1 the exercise is
+    emitted as a RepeatGroupDTO iterated that many times (work + rest per set), so
+    Garmin shows the real set count — previously "sets" only ever reached the
+    description text and every exercise displayed as 1 set. The name is preserved
+    in the step "description", which is what survives the round trip. It is also
+    sent as "exerciseName", but Garmin only retains that when it matches one of
+    its own exercise keys (e.g. "FARMERS_CARRY"); any other value is accepted and
+    then stored as an empty string.
 
     "category" is optional and only emitted when the caller supplies one, uppercased
     and otherwise passed through untouched. Garmin validates it against its own enum
@@ -276,7 +430,7 @@ def build_strength_json(
     steps: List[dict] = []
     step_order = 1
 
-    for ex in exercises:
+    for index, ex in enumerate(exercises):
         ex_name = ex.get("name", "Exercise")
         sets = int(ex.get("sets", 1))
         reps = int(ex.get("reps", 1))
@@ -305,11 +459,44 @@ def build_strength_json(
                 )
             step["category"] = category.strip().upper()
 
+        if sets > 1:
+            # N sets = a repeat group iterated N times (work + rest per iteration).
+            # The explicit stepTypeId 6 / endCondition "iterations" shape matches
+            # what _sanitize_repeat_group enforces on the upload path: the Garmin
+            # API silently corrupts a RepeatGroupDTO without a valid iterations
+            # endCondition.
+            group_steps = [{**step, "stepOrder": 1}]
+            if rest_seconds > 0:
+                group_steps.append({
+                    "type": "ExecutableStepDTO",
+                    "stepOrder": 2,
+                    "stepType": {"stepTypeId": 4, "stepTypeKey": "recovery"},
+                    "description": f"Rest {rest_seconds}s",
+                    "endCondition": {"conditionTypeId": 2, "conditionTypeKey": "time"},
+                    "endConditionValue": float(rest_seconds),
+                    "targetType": {"workoutTargetTypeId": 1, "workoutTargetTypeKey": "no.target"},
+                })
+            steps.append({
+                "type": "RepeatGroupDTO",
+                "stepOrder": step_order,
+                "stepType": {"stepTypeId": 6, "stepTypeKey": "repeat"},
+                "numberOfIterations": sets,
+                "smartRepeat": False,
+                "endCondition": {"conditionTypeId": 7, "conditionTypeKey": "iterations"},
+                "workoutSteps": group_steps,
+            })
+            step_order += 1
+            # The in-group rest after the final set already separates this exercise
+            # from the next one — no extra inter-exercise rest step.
+            continue
+
         steps.append(step)
         step_order += 1
 
-        # Rest step (skip after last exercise)
-        if rest_seconds > 0 and ex != exercises[-1]:
+        # Rest step (skip after last exercise). Compared by index, not by value:
+        # two identical exercise dicts would otherwise make an earlier one look
+        # like the last and lose its rest step.
+        if rest_seconds > 0 and index != len(exercises) - 1:
             steps.append({
                 "type": "ExecutableStepDTO",
                 "stepOrder": step_order,
@@ -444,6 +631,81 @@ def register_tools(app):
             return f"Error creating run workout: {str(e)}"
 
     @app.tool()
+    async def create_run_interval_workout(
+        name: str,
+        repeats: int,
+        rep_seconds: int,
+        recovery_seconds: int,
+        warmup_min: int,
+        cooldown_min: int,
+        hr_zone: str = "Z4",
+        hr_min: Optional[int] = None,
+        hr_max: Optional[int] = None,
+        recovery_hr_min: Optional[int] = None,
+        recovery_hr_max: Optional[int] = None,
+    ) -> str:
+        """Create a repeat-based interval run workout and upload it to Garmin Connect.
+
+        Builds warmup -> repeats x [work interval + jog recovery] -> cooldown. Use this
+        instead of create_run_workout whenever the session has more than one work
+        interval (threshold reps, VO2 intervals, cruise intervals, strides).
+
+        Work intervals target a named heart-rate zone by default, but named zones are
+        usually far too wide for interval work: a threshold session at 172-180 bpm sits
+        inside a Z3 that may span 158-184. Pass hr_min and hr_max together to target the
+        exact bpm range, so the watch alerts as soon as the effort drifts off target.
+
+        Recovery steps carry no target unless recovery_hr_min/max are given -- a capped
+        recovery alerts constantly right after a hard rep, since heart rate lags effort.
+
+        Example -- 3 x 6 min at HR 172-180 with 3 min jogs, 12m warmup, 8m cooldown:
+            repeats=3, rep_seconds=360, recovery_seconds=180,
+            hr_min=172, hr_max=180, warmup_min=12, cooldown_min=8
+
+        Args:
+            name: Workout name (e.g. "Threshold 3x6min")
+            repeats: Number of work intervals
+            rep_seconds: Duration of each work interval in seconds
+            recovery_seconds: Jog recovery between work intervals in seconds (0 to omit)
+            warmup_min: Warmup duration in minutes
+            cooldown_min: Cooldown duration in minutes
+            hr_zone: Target zone for the work intervals (Z1-Z5, default Z4). Ignored if hr_min/hr_max are given.
+            hr_min: Custom target HR range for the work intervals, minimum bpm (with hr_max)
+            hr_max: Custom target HR range for the work intervals, maximum bpm (with hr_min)
+            recovery_hr_min: Optional HR range for recovery jogs, minimum bpm (with recovery_hr_max)
+            recovery_hr_max: Optional HR range for recovery jogs, maximum bpm (with recovery_hr_min)
+        """
+        try:
+            workout_json = build_run_interval_json(
+                name=name,
+                repeats=repeats,
+                rep_seconds=rep_seconds,
+                recovery_seconds=recovery_seconds,
+                warmup_min=warmup_min,
+                cooldown_min=cooldown_min,
+                hr_zone=hr_zone,
+                hr_min=hr_min,
+                hr_max=hr_max,
+                recovery_hr_min=recovery_hr_min,
+                recovery_hr_max=recovery_hr_max,
+            )
+            result = garmin_client.upload_workout(workout_json)  # noqa: F821
+
+            if isinstance(result, dict):
+                curated = {
+                    "status": "success",
+                    "workout_id": result.get("workoutId"),
+                    "name": result.get("workoutName"),
+                    "message": "Interval workout uploaded successfully",
+                }
+                curated = {k: v for k, v in curated.items() if v is not None}
+                return json.dumps(curated, indent=2)
+            return json.dumps(result, indent=2)
+        except Exception as e:
+            return f"Error creating run interval workout: {str(e)}"
+
+
+    @app.tool()
     async def create_z2_walk_workout(
         name: str,
         duration_min: int,
@@ -487,7 +749,9 @@ def register_tools(app):
     ) -> str:
         """Create a strength workout and upload it to Garmin Connect.
 
-        Each exercise becomes a reps-based step. The name is kept in the step
+        Each exercise becomes a reps-based step; when sets > 1 the exercise is
+        emitted as a repeat group of that many iterations (work + rest per set),
+        so Garmin shows the real set count. The name is kept in the step
         description; it is also sent as exerciseName, which Garmin only retains when
         it matches one of its own exercise keys (e.g. "FARMERS_CARRY").
 
