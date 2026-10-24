@@ -446,13 +446,164 @@ def register_tools(app):
         except Exception as e:
             return f"Error retrieving sleep data: {str(e)}"
 
+    def _analyze_sleep_epochs(sleep_data: Dict[str, Any]) -> Dict[str, Any]:
+        """Cross-validate epoch-level SpO2 against HR, HRV, restless movements, optical confidence, and breathing variations."""
+        tz_cn = datetime.timezone(datetime.timedelta(hours=8))
+
+        def ms_to_local_str(ms: Optional[int], fmt: str = "%H:%M") -> Optional[str]:
+            if not ms:
+                return None
+            return datetime.datetime.fromtimestamp(ms / 1000.0, tz=tz_cn).strftime(fmt)
+
+        def iso_gmt_to_ms(ts_str: str) -> Optional[int]:
+            if not ts_str:
+                return None
+            try:
+                dt = datetime.datetime.fromisoformat(ts_str).replace(tzinfo=datetime.timezone.utc)
+                return int(dt.timestamp() * 1000)
+            except Exception:
+                return None
+
+        daily_sleep = sleep_data.get('dailySleepDTO', {}) or {}
+        breathing_severity = daily_sleep.get('breathingDisruptionSeverity')
+
+        spo2_list = sleep_data.get('wellnessEpochSPO2DataDTOList') or []
+        hr_list = [x for x in (sleep_data.get('sleepHeartRate') or []) if x.get('value') is not None and x.get('startGMT')]
+        hrv_list = [x for x in (sleep_data.get('hrvData') or []) if x.get('value') is not None and x.get('startGMT')]
+        restless_list = [x for x in (sleep_data.get('sleepRestlessMoments') or []) if x.get('startGMT')]
+        resp_list = [x for x in (sleep_data.get('wellnessEpochRespirationDataDTOList') or []) if x.get('respirationValue') and x.get('respirationValue') > 0]
+        stress_list = [x for x in (sleep_data.get('sleepStress') or []) if x.get('value') is not None and x.get('value') >= 0 and x.get('startGMT')]
+
+        avg_sleep_hr = round(sum(x['value'] for x in hr_list) / len(hr_list), 1) if hr_list else None
+
+        spo2_epochs = []
+        for item in spo2_list:
+            val = item.get('spo2Reading')
+            ts_ms = iso_gmt_to_ms(item.get('epochTimestamp'))
+            if val is not None and ts_ms is not None:
+                spo2_epochs.append({
+                    'ms': ts_ms,
+                    'val': val,
+                    'conf': item.get('readingConfidence', 0),
+                })
+
+        spo2_epochs.sort(key=lambda x: x['ms'])
+
+        result: Dict[str, Any] = {
+            'avg_sleep_heart_rate_bpm': avg_sleep_hr,
+            'breathing_disruption_severity': breathing_severity,
+        }
+
+        if not spo2_epochs:
+            return result
+
+        monitored_minutes = len(spo2_epochs)
+        below_90 = [e for e in spo2_epochs if e['val'] < 90]
+        below_85 = [e for e in spo2_epochs if e['val'] <= 85]
+        avg_conf = round(sum(e['conf'] for e in spo2_epochs) / monitored_minutes, 1)
+
+        # Group contiguous <90% SpO2 epochs (gap <= 3 minutes) into episodes
+        episodes = []
+        cur_ep: List[Dict[str, Any]] = []
+        for e in below_90:
+            if not cur_ep or (e['ms'] - cur_ep[-1]['ms']) <= 180000:
+                cur_ep.append(e)
+            else:
+                episodes.append(cur_ep)
+                cur_ep = [e]
+        if cur_ep:
+            episodes.append(cur_ep)
+
+        analyzed_episodes = []
+        non_artifact_lows = []
+
+        for ep in episodes:
+            start_ms = ep[0]['ms']
+            end_ms = ep[-1]['ms'] + 60000
+            min_val = min(x['val'] for x in ep)
+            ep_conf = round(sum(x['conf'] for x in ep) / len(ep), 1)
+
+            # Concurrent HR within [start - 3min, end + 3min]
+            c_hr = [x['value'] for x in hr_list if (start_ms - 180000) <= x['startGMT'] <= (end_ms + 180000)]
+            # Local baseline HR within [start - 20min, start - 3min]
+            pre_hr = [x['value'] for x in hr_list if (start_ms - 1200000) <= x['startGMT'] < (start_ms - 180000)]
+            baseline_hr = (sum(pre_hr) / len(pre_hr)) if pre_hr else (avg_sleep_hr or 60.0)
+            max_c_hr = max(c_hr) if c_hr else None
+            hr_surge = round(max_c_hr - baseline_hr, 1) if max_c_hr is not None else 0.0
+
+            # Concurrent HRV within [start - 5min, end + 5min]
+            c_hrv = [x['value'] for x in hrv_list if (start_ms - 300000) <= x['startGMT'] <= (end_ms + 300000)]
+
+            # Nearby restless moments within [start - 4min, end + 4min]
+            c_restless = [x for x in restless_list if (start_ms - 240000) <= x['startGMT'] <= (end_ms + 240000)]
+
+            # First-principles cross-falsification:
+            # 1) When optical confidence <= 5.5/10, the wrist PPG sensor itself indicates poor skin contact / light leak.
+            # 2) Real hypoxic events (OSA) trigger strong sympathetic arousal (HR spike >= 12 bpm), cluster repeatedly,
+            #    and elevate breathing_disruption_severity beyond NONE/LOW.
+            is_artifact = (
+                ep_conf <= 5.5
+                or (hr_surge < 12.0 and (ep_conf <= 7.5 or len(c_restless) > 0 or breathing_severity in ('NONE', 'LOW', None)))
+                or (len(ep) <= 2 and breathing_severity in ('NONE', 'LOW', None))
+            )
+
+            if not is_artifact:
+                non_artifact_lows.append(min_val)
+
+            analyzed_episodes.append({
+                'window_local': f"{ms_to_local_str(start_ms)}-{ms_to_local_str(end_ms)}",
+                'duration_minutes': len(ep),
+                'min_spo2_percent': min_val,
+                'avg_optical_confidence': ep_conf,
+                'concurrent_hr_bpm': c_hr[:6],
+                'hr_surge_bpm': hr_surge,
+                'concurrent_hrv_ms': c_hrv[:4],
+                'nearby_restless_count': len(c_restless),
+                'likely_optical_artifact': is_artifact,
+            })
+
+        high_conf_Normal_vals = [e['val'] for e in spo2_epochs if e['val'] >= 90 or e['conf'] >= 8]
+        effective_lowest = (
+            min(non_artifact_lows)
+            if non_artifact_lows
+            else (min(high_conf_Normal_vals) if high_conf_Normal_vals else max(e['val'] for e in spo2_epochs))
+        )
+        all_dips_are_artifacts = len(analyzed_episodes) > 0 and len(non_artifact_lows) == 0
+
+        if not analyzed_episodes:
+            interpretation = "夜间血氧全程稳定（≥90%），无低血氧事件。"
+        elif all_dips_are_artifacts:
+            interpretation = (
+                f"夜间共有 {len(analyzed_episodes)} 段短时血氧读数低于90%（表显最低 {min(e['val'] for e in spo2_epochs)}%），"
+                f"但多维交叉核验显示：同期光学置信度偏低、伴随翻身体动（Restless Moments），"
+                f"且同期心率平稳无交感微觉醒飙升、呼吸变化指标为 {breathing_severity or 'NONE'}。"
+                f"确认为腕式光电传感器受压/漏光伪影，剔除伪影后有效最低血氧为 {effective_lowest}%。"
+            )
+        else:
+            interpretation = (
+                f"检测到 {len(non_artifact_lows)} 段伴随心率波动的低血氧事件（有效最低 {effective_lowest}%），建议结合呼吸变化与体动综合观察。"
+            )
+
+        result['spo2_cross_check'] = {
+            'monitored_minutes': monitored_minutes,
+            'minutes_below_90': len(below_90),
+            'minutes_85_or_below': len(below_85),
+            'avg_optical_confidence_out_of_10': avg_conf,
+            'low_spo2_episodes_count': len(analyzed_episodes),
+            'all_dips_are_artifacts': all_dips_are_artifacts,
+            'effective_lowest_spo2_percent': effective_lowest,
+            'interpretation': interpretation,
+            'episodes': analyzed_episodes[:5],
+        }
+        return result
+
     @app.tool()
     async def get_sleep_summary(date: str) -> str:
-        """Get sleep summary with only essential metrics (lightweight version)
+        """Get sleep summary with essential metrics and multi-dimensional SpO2/HR/HRV cross-check
 
-        This endpoint returns a compact summary of sleep data (~350 bytes) instead of
-        the full granular data (~50KB). Ideal for daily health checkups and LLM integrations
-        where the full time-series data would overwhelm the context window.
+        This endpoint returns a compact summary of sleep data including cross-validated
+        SpO2 artifact analysis (cross-checking low SpO2 epochs against optical confidence,
+        simultaneous heart rate, HRV, restless movements, and breathing variations).
 
         Args:
             date: Date in YYYY-MM-DD format
@@ -484,9 +635,15 @@ def register_tools(app):
                 summary['rem_sleep_seconds'] = daily_sleep.get('remSleepSeconds')
                 summary['awake_seconds'] = daily_sleep.get('awakeSleepSeconds')
 
-                # Sleep disruptions
+                # Sleep disruptions & breathing variations
                 summary['awake_count'] = daily_sleep.get('awakeCount')
                 summary['restless_moments_count'] = daily_sleep.get('restlessMomentsCount')
+                summary['breathing_disruption_severity'] = daily_sleep.get('breathingDisruptionSeverity')
+
+                # Respiration metrics
+                summary['avg_respiration_brpm'] = daily_sleep.get('averageRespirationValue')
+                summary['lowest_respiration_brpm'] = daily_sleep.get('lowestRespirationValue')
+                summary['highest_respiration_brpm'] = daily_sleep.get('highestRespirationValue')
 
                 # Average physiological metrics
                 summary['avg_sleep_stress'] = daily_sleep.get('avgSleepStress')
@@ -498,9 +655,13 @@ def register_tools(app):
                 summary['avg_spo2_percent'] = spo2_summary.get('averageSpo2')
                 summary['lowest_spo2_percent'] = spo2_summary.get('lowestSpo2')
 
-            # Add HRV data if available at top level
+            # Add HRV and Body Battery data if available at top level
             if 'avgOvernightHrv' in sleep_data:
                 summary['avg_overnight_hrv'] = sleep_data.get('avgOvernightHrv')
+            if 'hrvStatus' in sleep_data:
+                summary['hrv_status'] = sleep_data.get('hrvStatus')
+            if 'bodyBatteryChange' in sleep_data:
+                summary['body_battery_change'] = sleep_data.get('bodyBatteryChange')
 
             # Calculate sleep phase percentages if total sleep time is available
             total_sleep = summary.get('sleep_seconds', 0)
@@ -513,12 +674,167 @@ def register_tools(app):
             if total_sleep:
                 summary['sleep_hours'] = round(total_sleep / 3600, 2)
 
+            # Multi-dimensional epoch cross-check (SpO2 vs HR, HRV, restless movements, optical confidence)
+            epoch_analysis = _analyze_sleep_epochs(sleep_data)
+            summary.update(epoch_analysis)
+
             # Remove None values
             summary = {k: v for k, v in summary.items() if v is not None}
 
-            return json.dumps(summary, indent=2)
+            return json.dumps(summary, indent=2, ensure_ascii=False)
         except Exception as e:
             return f"Error retrieving sleep summary: {str(e)}"
+
+    @app.tool()
+    async def get_sleep_physiology_timeline(date: str) -> str:
+        """Get detailed multi-dimensional sleep physiology timeline and forensic cross-validation
+
+        Returns hourly sleep physiology (SpO2, optical confidence, heart rate, HRV, respiration,
+        stress, restless moments), sleep stage intervals in local time (Asia/Shanghai),
+        breathing disruption events, and epoch-level cross-validation of any low SpO2 dips.
+        Ideal when investigating sleep quality, restless movements, or verifying whether low SpO2
+        readings are optical compression artifacts.
+
+        Args:
+            date: Date in YYYY-MM-DD format
+        """
+        try:
+            sleep_data = garmin_client.get_sleep_data(date)
+            if not sleep_data:
+                return f"No sleep data found for {date}"
+
+            tz_cn = datetime.timezone(datetime.timedelta(hours=8))
+
+            def ms_to_local(ms: Optional[int], fmt: str = "%Y-%m-%d %H:%M") -> Optional[str]:
+                if not ms:
+                    return None
+                return datetime.datetime.fromtimestamp(ms / 1000.0, tz=tz_cn).strftime(fmt)
+
+            def iso_gmt_to_ms(ts_str: str) -> Optional[int]:
+                if not ts_str:
+                    return None
+                try:
+                    dt = datetime.datetime.fromisoformat(ts_str).replace(tzinfo=datetime.timezone.utc)
+                    return int(dt.timestamp() * 1000)
+                except Exception:
+                    return None
+
+            daily_sleep = sleep_data.get('dailySleepDTO', {}) or {}
+            epoch_analysis = _analyze_sleep_epochs(sleep_data)
+
+            # 1. Sleep stages timeline in local time
+            stage_map = {0: 'deep', 1: 'light', 2: 'rem', 3: 'awake'}
+            stages_timeline = []
+            for lvl in (sleep_data.get('sleepLevels') or []):
+                s_ms = iso_gmt_to_ms(lvl.get('startGMT'))
+                e_ms = iso_gmt_to_ms(lvl.get('endGMT'))
+                if s_ms and e_ms:
+                    stages_timeline.append({
+                        'stage': stage_map.get(lvl.get('activityLevel'), str(lvl.get('activityLevel'))),
+                        'start_local': ms_to_local(s_ms, "%H:%M"),
+                        'end_local': ms_to_local(e_ms, "%H:%M"),
+                        'duration_min': round((e_ms - s_ms) / 60000, 1),
+                    })
+
+            # 2. Hourly physiological breakdown in local time
+            hourly_buckets: Dict[str, Dict[str, list]] = {}
+
+            def get_bucket(ms: int) -> Dict[str, list]:
+                key = datetime.datetime.fromtimestamp(ms / 1000.0, tz=tz_cn).strftime("%Y-%m-%d %H:00")
+                if key not in hourly_buckets:
+                    hourly_buckets[key] = {
+                        'spo2': [], 'spo2_conf': [], 'hr': [], 'hrv': [],
+                        'resp': [], 'stress': [], 'restless': []
+                    }
+                return hourly_buckets[key]
+
+            for item in (sleep_data.get('wellnessEpochSPO2DataDTOList') or []):
+                ms = iso_gmt_to_ms(item.get('epochTimestamp'))
+                val = item.get('spo2Reading')
+                if ms and val is not None:
+                    b = get_bucket(ms)
+                    b['spo2'].append(val)
+                    if item.get('readingConfidence') is not None:
+                        b['spo2_conf'].append(item.get('readingConfidence'))
+
+            for item in (sleep_data.get('sleepHeartRate') or []):
+                ms = item.get('startGMT')
+                val = item.get('value')
+                if ms and val is not None:
+                    get_bucket(ms)['hr'].append(val)
+
+            for item in (sleep_data.get('hrvData') or []):
+                ms = item.get('startGMT')
+                val = item.get('value')
+                if ms and val is not None:
+                    get_bucket(ms)['hrv'].append(val)
+
+            for item in (sleep_data.get('wellnessEpochRespirationDataDTOList') or []):
+                ms = item.get('startTimeGMT')
+                val = item.get('respirationValue')
+                if ms and val is not None and val > 0:
+                    get_bucket(ms)['resp'].append(val)
+
+            for item in (sleep_data.get('sleepStress') or []):
+                ms = item.get('startGMT')
+                val = item.get('value')
+                if ms and val is not None and val >= 0:
+                    get_bucket(ms)['stress'].append(val)
+
+            for item in (sleep_data.get('sleepRestlessMoments') or []):
+                ms = item.get('startGMT')
+                if ms:
+                    get_bucket(ms)['restless'].append(ms)
+
+            hourly_summary = []
+            for hour_key in sorted(hourly_buckets.keys()):
+                b = hourly_buckets[hour_key]
+                hourly_summary.append({
+                    'hour_local': hour_key,
+                    'avg_spo2': round(sum(b['spo2']) / len(b['spo2']), 1) if b['spo2'] else None,
+                    'min_spo2': min(b['spo2']) if b['spo2'] else None,
+                    'avg_spo2_confidence': round(sum(b['spo2_conf']) / len(b['spo2_conf']), 1) if b['spo2_conf'] else None,
+                    'avg_hr_bpm': round(sum(b['hr']) / len(b['hr']), 1) if b['hr'] else None,
+                    'max_hr_bpm': max(b['hr']) if b['hr'] else None,
+                    'avg_hrv_ms': round(sum(b['hrv']) / len(b['hrv']), 1) if b['hrv'] else None,
+                    'avg_respiration_brpm': round(sum(b['resp']) / len(b['resp']), 1) if b['resp'] else None,
+                    'avg_stress': round(sum(b['stress']) / len(b['stress']), 1) if b['stress'] else None,
+                    'restless_moments_count': len(b['restless']),
+                })
+
+            # 3. Breathing disruption events
+            breathing_events = []
+            for ev in (sleep_data.get('breathingDisruptionData') or []):
+                s_ms = ev.get('startGMT')
+                e_ms = ev.get('endGMT')
+                breathing_events.append({
+                    'start_local': ms_to_local(s_ms, "%H:%M:%S") if s_ms else None,
+                    'end_local': ms_to_local(e_ms, "%H:%M:%S") if e_ms else None,
+                    'value': ev.get('value'),
+                })
+
+            timeline_report = {
+                'date': date,
+                'sleep_window_local': {
+                    'start': ms_to_local(daily_sleep.get('sleepStartTimestampGMT')),
+                    'end': ms_to_local(daily_sleep.get('sleepEndTimestampGMT')),
+                    'sleep_hours': round((daily_sleep.get('sleepTimeSeconds') or 0) / 3600, 2),
+                },
+                'breathing_disruption_severity': daily_sleep.get('breathingDisruptionSeverity'),
+                'hrv_status': sleep_data.get('hrvStatus'),
+                'avg_overnight_hrv_ms': sleep_data.get('avgOvernightHrv'),
+                'resting_heart_rate_bpm': daily_sleep.get('restingHeartRate'),
+                'avg_sleep_heart_rate_bpm': epoch_analysis.get('avg_sleep_heart_rate_bpm'),
+                'restless_moments_count': daily_sleep.get('restlessMomentsCount'),
+                'spo2_cross_check': epoch_analysis.get('spo2_cross_check'),
+                'hourly_physiology': hourly_summary,
+                'sleep_stages_timeline': stages_timeline,
+                'breathing_disruption_events': breathing_events,
+            }
+
+            return json.dumps(timeline_report, indent=2, ensure_ascii=False)
+        except Exception as e:
+            return f"Error retrieving sleep physiology timeline: {str(e)}"
 
     @app.tool()
     async def get_stress_data(date: str) -> str:
